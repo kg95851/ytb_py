@@ -1,0 +1,6 @@
+streamlit
+selenium
+requests
+pandas
+matplotlib
+2captcha-python 
