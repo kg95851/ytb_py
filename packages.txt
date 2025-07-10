@@ -5,5 +5,5 @@ libfontconfig1
 libxss1
 libgtk-3-0
 libgbm-dev
-chromium-browser
-chromium-chromedriver 
+chromium
+chromium-driver 
