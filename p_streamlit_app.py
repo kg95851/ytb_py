@@ -25,6 +25,8 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from twocaptcha import TwoCaptcha
+from PIL import Image
+import base64
 
 # APP_DATA_FILE = "app_data.json" # 로컬 파일 저장 기능 삭제
 
@@ -244,6 +246,7 @@ def should_include_subscriber(subscriber_count):
 # --- Selenium/Scraping Logic ---
 def init_driver():
     options = Options()
+    # 사용자가 선택한 모드에 따라 헤드리스 옵션을 조건부로 추가합니다.
     if st.session_state.get("run_headless", True):
         log("INFO: 헤드리스 모드로 실행합니다.")
         options.add_argument("--headless")
@@ -253,14 +256,16 @@ def init_driver():
 
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    # options.add_experimental_option("detach", True) # 헤드리스 모드에서는 이 옵션이 불필요합니다.
+    options.add_argument("--disable-gpu")
+    
     try:
+        log("INFO: WebDriver를 초기화합니다.")
         driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(30)
         return driver
     except Exception as e:
         log(f"❌ WebDriver 초기화 실패: {e}")
-        st.error(f"WebDriver 초기화 실패: {e}. Chrome과 ChromeDriver가 설치되어 있고, PATH에 등록되어 있는지 확인하세요.")
+        st.error(f"WebDriver 초기화 실패: {e}. 배포 환경 설정을 확인하세요.")
         return None
 
 def do_login(email, password):
@@ -298,57 +303,92 @@ def do_login(email, password):
 
 def detect_and_handle_captcha(driver):
     try:
-        captcha_elements = driver.find_elements(By.CSS_SELECTOR, ".g-recaptcha")
-        if captcha_elements and st.session_state['2captcha_api_key']:
-            log("🚨 캡챠가 감지되었습니다! 2Captcha로 자동 해결을 시도합니다.")
-            
-            site_key = captcha_elements[0].get_attribute("data-sitekey")
-            page_url = driver.current_url
+        # 먼저 일반 reCAPTCHA 체크박스 확인
+        iframe = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='recaptcha']")
+        if not iframe:
+            return None # 캡챠 없음
 
-            config = {
-                'apiKey': st.session_state['2captcha_api_key']
-            }
+        driver.switch_to.frame(iframe[0])
+        
+        # 체크박스 유형 캡챠 시도
+        checkbox = driver.find_elements(By.ID, "recaptcha-anchor")
+        if checkbox:
+            checkbox[0].click()
+            log("INFO: reCAPTCHA 체크박스를 클릭했습니다.")
+            time.sleep(2) # 이미지 챌린지가 나타날 시간을 줍니다.
+        
+        driver.switch_to.default_content()
+
+        # 이미지 챌린지가 나타났는지 확인
+        image_challenge_iframe = driver.find_elements(By.CSS_SELECTOR, "iframe[title='recaptcha challenge']")
+        if image_challenge_iframe and st.session_state.get('2captcha_api_key'):
+            log("🚨 이미지 선택형 캡챠가 감지되었습니다! 2Captcha로 자동 해결을 시도합니다.")
+            driver.switch_to.frame(image_challenge_iframe[0])
+
+            # 이미지 캡처
+            img_element = driver.find_element(By.ID, "rc-imageselect")
+            img_base64 = img_element.screenshot_as_base64
+            
+            # 질문 텍스트 가져오기
+            instruction_element = driver.find_element(By.CSS_SELECTOR, ".rc-imageselect-instructions-text")
+            instruction_text = instruction_element.text
+            
+            log(f"캡챠 질문: {instruction_text}")
+
+            config = {'apiKey': st.session_state['2captcha_api_key']}
             solver = TwoCaptcha(**config)
 
             try:
-                result = solver.recaptcha(
-                    sitekey=site_key,
-                    url=page_url
+                result = solver.grid(
+                    file=f'base64:{img_base64}',
+                    textinstructions=instruction_text
                 )
                 
-                log("✅ 2Captcha 해결 완료. 토큰을 주입합니다.")
+                log("✅ 2Captcha 이미지 분석 완료. 클릭을 시도합니다.")
                 
-                # The g-recaptcha-response textarea is often hidden.
-                # We need to execute javascript to set its value.
-                recaptcha_response = result['code']
-                driver.execute_script(
-                    f"document.getElementById('g-recaptcha-response').innerHTML = '{recaptcha_response}';"
-                )
+                # 결과에서 클릭해야 할 칸(cell)의 번호를 가져옵니다.
+                clicks = result['code'].replace('click:', '').split('/')
                 
-                # It can also be beneficial to trigger the callback function if one is defined
-                # This part can be site-specific
-                try:
-                    callback_func = captcha_elements[0].get_attribute("data-callback")
-                    if callback_func:
-                        driver.execute_script(f"{callback_func}('{recaptcha_response}');")
-                        log("캡챠 콜백 함수를 실행했습니다.")
-                except Exception as e:
-                    log(f"콜백 함수 실행 중 오류 (무시 가능): {e}")
+                # 이미지 그리드에서 셀을 찾아 클릭
+                all_cells = driver.find_elements(By.CSS_SELECTOR, ".rc-imageselect-tile")
+                for click_index in clicks:
+                    try:
+                        cell_to_click = all_cells[int(click_index) - 1]
+                        cell_to_click.click()
+                        time.sleep(0.5)
+                    except Exception as e:
+                        log(f"셀 {click_index} 클릭 중 오류: {e}")
 
-                time.sleep(3) # Give time for submission logic to process the token
+                # 확인 버튼 클릭
+                verify_button = driver.find_element(By.ID, "recaptcha-verify-button")
+                verify_button.click()
+                log("캡챠 확인 버튼을 클릭했습니다.")
+                
+                driver.switch_to.default_content()
+                time.sleep(5) # 해결 후 페이지 변경 대기
                 return True
 
             except Exception as e:
-                log(f"❌ 2Captcha 해결 실패: {e}")
+                log(f"❌ 2Captcha 이미지 해결 실패: {e}")
+                driver.switch_to.default_content()
                 return False
+        
+        elif image_challenge_iframe:
+             log("이미지 캡챠가 감지되었으나, 2Captcha API 키가 없습니다. 헤드리스 모드를 끄고 직접 해결해주세요.")
+             driver.switch_to.default_content()
+             return False
 
-        elif captcha_elements:
-            log("캡챠가 감지되었지만 2Captcha API 키가 없습니다. 헤드리스 모드를 끄고 직접 해결해주세요.")
-            return False
-
+        # 체크박스 클릭만으로 통과된 경우
+        log("INFO: 캡챠가 체크박스 클릭만으로 해결되었을 수 있습니다.")
+        return None # 명확한 실패가 아니므로 None 반환
+    
     except Exception as e:
-        log(f"⚠️ 캡챠 감지 중 오류: {e}")
-    return False 
+        log(f"⚠️ 캡챠 감지/처리 중 예상치 못한 오류: {e}")
+        try:
+            driver.switch_to.default_content() # 오류 발생 시 기본 프레임으로 복귀
+        except:
+            pass
+    return False
 
 def crawl(is_short, dates, country_code, country_name, max_items):
     st.session_state.is_scraping = True
@@ -521,7 +561,7 @@ with st.sidebar:
         password = st.text_input("Playboard 비밀번호", type="password")
         
         st.session_state['2captcha_api_key'] = st.text_input(
-            "2Captcha API 키 (현재 세션에만 저장)", 
+            "2Captcha API 키 (선택 사항)", 
             value=st.session_state.get('2captcha_api_key', ''),
             type="password",
             help="캡챠 자동 해결을 위해 2Captcha API 키를 입력하세요. 브라우저 탭을 닫으면 초기화됩니다."
