@@ -3,4 +3,5 @@ selenium
 requests
 pandas
 matplotlib
-2captcha-python 
+2captcha-python
+Pillow 
