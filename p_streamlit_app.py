@@ -303,69 +303,68 @@ def do_login(email, password):
 
 def detect_and_handle_captcha(driver):
     try:
-        # 먼저 일반 reCAPTCHA 체크박스 확인
-        iframe = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='recaptcha']")
-        if not iframe:
+        # 1. 메인 프레임에서 'reCAPTCHA' iframe 찾기
+        recaptcha_iframe = driver.find_elements(By.CSS_SELECTOR, "iframe[title='reCAPTCHA']")
+        if not recaptcha_iframe:
             return None # 캡챠 없음
 
-        driver.switch_to.frame(iframe[0])
+        log("INFO: '로봇이 아닙니다' 캡챠 iframe 발견.")
+        driver.switch_to.frame(recaptcha_iframe[0])
         
-        # 체크박스 유형 캡챠 시도
+        # 2. '로봇이 아닙니다' 체크박스 클릭
         checkbox = driver.find_elements(By.ID, "recaptcha-anchor")
         if checkbox:
             checkbox[0].click()
-            log("INFO: reCAPTCHA 체크박스를 클릭했습니다.")
-            time.sleep(2) # 이미지 챌린지가 나타날 시간을 줍니다.
+            log("INFO: '로봇이 아닙니다' 체크박스를 클릭했습니다.")
+            time.sleep(3) # 이미지 챌린지가 로드될 시간을 줍니다.
         
+        # 3. 기본 컨텐츠로 돌아와서, 이미지 챌린지 iframe 찾기
         driver.switch_to.default_content()
+        challenge_iframe = driver.find_elements(By.CSS_SELECTOR, "iframe[title*='보안문자']")
+        
+        if not challenge_iframe:
+            log("INFO: 이미지 챌린지가 나타나지 않았습니다. 캡챠가 해결된 것 같습니다.")
+            return True
 
-        # 이미지 챌린지가 나타났는지 확인
-        image_challenge_iframe = driver.find_elements(By.CSS_SELECTOR, "iframe[title='recaptcha challenge']")
-        if image_challenge_iframe and st.session_state.get('2captcha_api_key'):
-            log("🚨 이미지 선택형 캡챠가 감지되었습니다! 2Captcha로 자동 해결을 시도합니다.")
-            driver.switch_to.frame(image_challenge_iframe[0])
+        if st.session_state.get('2captcha_api_key'):
+            log("🚨 이미지 선택형 캡챠 발견! 2Captcha로 자동 해결을 시도합니다.")
+            driver.switch_to.frame(challenge_iframe[0])
 
-            # 이미지 캡처
-            img_element = driver.find_element(By.ID, "rc-imageselect")
+            # 4. 이미지 캡처 및 질문 추출
+            img_element = driver.find_element(By.CSS_SELECTOR, "img.rc-image-tile-44")
             img_base64 = img_element.screenshot_as_base64
             
-            # 질문 텍스트 가져오기
-            instruction_element = driver.find_element(By.CSS_SELECTOR, ".rc-imageselect-instructions-text")
+            instruction_element = driver.find_element(By.CSS_SELECTOR, ".rc-imageselect-instructions strong")
             instruction_text = instruction_element.text
-            
-            log(f"캡챠 질문: {instruction_text}")
+            log(f"캡챠 질문: '{instruction_text}'에 해당하는 이미지를 선택합니다.")
 
+            # 5. 2Captcha로 해결 요청
             config = {'apiKey': st.session_state['2captcha_api_key']}
             solver = TwoCaptcha(**config)
-
             try:
-                result = solver.grid(
-                    file=f'base64:{img_base64}',
-                    textinstructions=instruction_text
+                result = solver.recaptcha(
+                    sitekey=driver.find_element(By.CSS_SELECTOR, ".g-recaptcha").get_attribute('data-sitekey'), # 사이트 키를 다시 가져옴
+                    url=driver.current_url,
+                    method='image',
+                    textinstructions=instruction_text,
+                    body=f'base64:{img_base64}'
                 )
                 
-                log("✅ 2Captcha 이미지 분석 완료. 클릭을 시도합니다.")
+                log("✅ 2Captcha 이미지 분석 완료. 토큰을 주입합니다.")
+                recaptcha_response = result['code']
                 
-                # 결과에서 클릭해야 할 칸(cell)의 번호를 가져옵니다.
-                clicks = result['code'].replace('click:', '').split('/')
+                driver.switch_to.default_content() # 토큰 주입을 위해 기본 프레임으로 돌아감
+                driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML = '{recaptcha_response}';")
+                log("INFO: 캡챠 해결 토큰 주입 완료.")
                 
-                # 이미지 그리드에서 셀을 찾아 클릭
-                all_cells = driver.find_elements(By.CSS_SELECTOR, ".rc-imageselect-tile")
-                for click_index in clicks:
-                    try:
-                        cell_to_click = all_cells[int(click_index) - 1]
-                        cell_to_click.click()
-                        time.sleep(0.5)
-                    except Exception as e:
-                        log(f"셀 {click_index} 클릭 중 오류: {e}")
-
-                # 확인 버튼 클릭
+                # 콜백 함수 실행 또는 제출 시도
+                driver.switch_to.frame(challenge_iframe[0]) # 다시 챌린지 프레임으로
                 verify_button = driver.find_element(By.ID, "recaptcha-verify-button")
                 verify_button.click()
-                log("캡챠 확인 버튼을 클릭했습니다.")
+                log("INFO: 확인 버튼 클릭.")
                 
                 driver.switch_to.default_content()
-                time.sleep(5) # 해결 후 페이지 변경 대기
+                time.sleep(5)
                 return True
 
             except Exception as e:
@@ -373,21 +372,16 @@ def detect_and_handle_captcha(driver):
                 driver.switch_to.default_content()
                 return False
         
-        elif image_challenge_iframe:
+        elif challenge_iframe:
              log("이미지 캡챠가 감지되었으나, 2Captcha API 키가 없습니다. 헤드리스 모드를 끄고 직접 해결해주세요.")
              driver.switch_to.default_content()
              return False
 
-        # 체크박스 클릭만으로 통과된 경우
-        log("INFO: 캡챠가 체크박스 클릭만으로 해결되었을 수 있습니다.")
-        return None # 명확한 실패가 아니므로 None 반환
-    
     except Exception as e:
         log(f"⚠️ 캡챠 감지/처리 중 예상치 못한 오류: {e}")
         try:
-            driver.switch_to.default_content() # 오류 발생 시 기본 프레임으로 복귀
-        except:
-            pass
+            driver.switch_to.default_content()
+        except: pass
     return False
 
 def crawl(is_short, dates, country_code, country_name, max_items):
