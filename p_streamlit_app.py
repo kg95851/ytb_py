@@ -99,6 +99,12 @@ def initialize_session_state():
         st.session_state['2captcha_api_key'] = ''
     if 'thread' not in st.session_state:
         st.session_state.thread = None
+    if 'stop_event' not in st.session_state:
+        st.session_state.stop_event = None
+    if 'log_queue' not in st.session_state:
+        st.session_state.log_queue = queue.Queue()
+    if 'result_queue' not in st.session_state:
+        st.session_state.result_queue = queue.Queue()
 
 initialize_session_state()
 
@@ -212,30 +218,24 @@ def convert_df_to_pdf(df):
 
 
 # --- Filter Logic ---
-def should_include_subscriber(subscriber_count):
-    if not st.session_state.is_filter_applied:
+def should_include_subscriber(subscriber_count, filter_settings):
+    """Checks if a subscriber count is within the selected ranges, using passed-in settings."""
+    if not filter_settings['is_filter_applied']:
         return True
     if subscriber_count == -1:
         return False
 
-    any_filter_selected = any(
-        st.session_state.subscriber_filters[cat][range_name]
-        for cat in st.session_state.subscriber_filters
-        for range_name in st.session_state.subscriber_filters[cat]
-    )
-
-    if not any_filter_selected and not st.session_state.use_custom_filter:
-        return True
-
-    for cat in st.session_state.subscriber_filters:
-        for range_name, is_selected in st.session_state.subscriber_filters[cat].items():
-            if is_selected:
-                min_val, max_val = st.session_state.filter_ranges[range_name]
-                if min_val <= subscriber_count < max_val:
-                    return True
+    # Check against selected ranges
+    for range_name, is_selected in filter_settings['selected_filters'].items():
+        if is_selected:
+            min_val, max_val = st.session_state.filter_ranges[range_name]
+            if min_val <= subscriber_count < max_val:
+                return True
     
-    if st.session_state.use_custom_filter:
-        min_val, max_val = st.session_state.custom_min, st.session_state.custom_max
+    # Check against custom filter
+    if filter_settings['use_custom_filter']:
+        min_val = filter_settings['custom_min']
+        max_val = filter_settings['custom_max']
         if min_val >= 0 and max_val < 0:
             return subscriber_count >= min_val
         elif min_val < 0 and max_val >= 0:
@@ -243,7 +243,16 @@ def should_include_subscriber(subscriber_count):
         elif min_val >= 0 and max_val >= 0:
             return min_val <= subscriber_count <= max_val
             
-    return False
+    # If any filter is applied but none match, return False
+    any_filter_selected = any(filter_settings['selected_filters'].values())
+    if any_filter_selected or filter_settings['use_custom_filter']:
+        return False
+        
+    return True # Default to True if no filters are selected at all
+
+def log_from_thread(log_queue, message):
+    """Safely log messages from a background thread using a queue."""
+    log_queue.put(message)
 
 # --- Selenium/Scraping Logic ---
 def init_driver():
@@ -386,91 +395,72 @@ def detect_and_handle_captcha(driver):
         except: pass
     return False
 
-def crawl(driver, is_short, dates, country_code, country_name, max_items):
-    # This function now accepts 'driver' as an argument
-    # ... (The rest of the crawl function logic is largely the same, 
-    # but it no longer gets the driver from session_state)
-    # It will use the passed 'driver' object.
-    # It will update st.session_state.log_messages and st.session_state.progress
-    # which are safe operations.
-    st.session_state.is_scraping = True
-    st.session_state.progress = 0
-
+def crawl(driver, is_short, dates, country_code, country_name, max_items, stop_event, log_q, result_q, filter_settings):
     try:
         all_collected_data = []
         processed_hashes = set()
         
-        # driver = st.session_state.driver -> This is now passed as an argument
         if not driver:
-            log("❌ 드라이버가 없습니다. 먼저 로그인 해주세요.")
+            log_from_thread(log_q, "❌ 드라이버가 없습니다. 먼저 로그인 해주세요.")
+            result_q.put(pd.DataFrame())
             return
 
         for a_date in dates:
-            if not st.session_state.is_scraping:
-                log("🛑 사용자에 의해 크롤링이 중단되었습니다.")
+            if stop_event.is_set():
+                log_from_thread(log_q, "🛑 사용자에 의해 크롤링이 중단되었습니다.")
                 break
+            
             try:
                 date_obj = datetime.strptime(a_date, '%Y%m%d')
                 kst = timezone(timedelta(hours=9))
                 date_obj = date_obj.replace(tzinfo=kst)
                 key = int(date_obj.timestamp())
             except ValueError:
-                log(f"❌ 날짜 형식이 올바르지 않습니다: {a_date}")
+                log_from_thread(log_q, f"❌ 날짜 형식이 올바르지 않습니다: {a_date}")
                 continue
 
-            log(f"🎯 {date_obj.strftime('%Y-%m-%d')} 날짜 크롤링 시작 (목표: {max_items}개)...")
+            log_from_thread(log_q, f"🎯 {date_obj.strftime('%Y-%m-%d')} 날짜 크롤링 시작 (목표: {max_items}개)...")
 
             if is_short:
                 url = f"https://playboard.co/chart/short/most-viewed-all-videos-in-{country_code}-daily?period={key}"
             else:
                 url = f"https://playboard.co/chart/video/?period={key}"
             
-            log(f"➡️ URL로 이동 중: {url}")
+            log_from_thread(log_q, f"➡️ URL로 이동 중: {url}")
             
             try:
                 driver.get(url)
-                log("...페이지 로딩 대기 중...")
+                log_from_thread(log_q, "...페이지 로딩 대기 중...")
                 WebDriverWait(driver, 45).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.title__label")))
-                log("✅ 페이지 로딩 완료.")
-            except TimeoutException:
-                log(f"❌ 페이지 로딩 시간 초과: {url}")
-                log("네트워크 연결을 확인하거나, 사이트가 다운되었을 수 있습니다. 다음 날짜로 넘어갑니다.")
-                continue
+                log_from_thread(log_q, "✅ 페이지 로딩 완료.")
             except Exception as e:
-                log(f"❌ 페이지 로딩 실패: {e}")
+                log_from_thread(log_q, f"❌ 페이지 로딩 실패: {e}")
                 continue
 
             scroll_count = 0
             max_scrolls = (max_items // 20) + 15
             no_change_count = 0
             
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
             prev_items_count = 0
-            while True:
+            while not stop_event.is_set():
                 current_items_on_page = len(driver.find_elements(By.CSS_SELECTOR, "a.title__label"))
-                status_text.text(f"스크롤 {scroll_count}회, 페이지 항목: {current_items_on_page}개")
+                log_from_thread(log_q, f"스크롤 {scroll_count}회, 페이지 항목: {current_items_on_page}개")
                 
-                if current_items_on_page >= max_items:
-                    log(f"✅ 목표 항목 수({max_items}) 이상을 페이지에서 찾았습니다. 스크롤을 중단합니다.")
-                    break
-
-                if scroll_count >= max_scrolls:
-                    log(f"⚠️ 최대 스크롤 횟수({max_scrolls})에 도달했습니다. 현재까지 찾은 항목으로 진행합니다.")
+                if current_items_on_page >= max_items or scroll_count >= max_scrolls:
+                    log_from_thread(log_q, "✅ 목표 항목 수에 도달하여 스크롤을 중단합니다.")
                     break
                 
+                prev_items_count = current_items_on_page
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 scroll_count += 1
                 time.sleep(2.5) 
                 
                 new_items_on_page = len(driver.find_elements(By.CSS_SELECTOR, "a.title__label"))
-
                 if new_items_on_page == prev_items_count:
                     no_change_count += 1
-                    log(f"⚠️ 스크롤 후 새 항목이 로드되지 않았습니다. ({no_change_count}/3)")
+                    log_from_thread(log_q, f"⚠️ 스크롤 후 새 항목이 로드되지 않았습니다. ({no_change_count}/3)")
                     if no_change_count >= 3:
-                        log("더 이상 새 항목이 로드되지 않아 스크롤을 중단합니다.")
+                        log_from_thread(log_q, "더 이상 새 항목이 로드되지 않아 스크롤을 중단합니다.")
                         if not detect_and_handle_captcha(driver):
                             break
                         else: 
@@ -479,7 +469,7 @@ def crawl(driver, is_short, dates, country_code, country_name, max_items):
                     no_change_count = 0
                 prev_items_count = new_items_on_page
 
-            log("🔍 데이터 수집 및 처리 중...")
+            log_from_thread(log_q, "🔍 데이터 수집 및 처리 중...")
             
             title_elements = driver.find_elements(By.CSS_SELECTOR, "a.title__label")
             view_elements = driver.find_elements(By.CSS_SELECTOR, "span.fluc-label")
@@ -487,12 +477,14 @@ def crawl(driver, is_short, dates, country_code, country_name, max_items):
             channel_elements = driver.find_elements(By.CSS_SELECTOR, "td.channel a span.name")
             subscriber_elements = driver.find_elements(By.CSS_SELECTOR, "div.subs span.subs__count")
 
-            log(f"총 {len(title_elements)}개 항목을 페이지에서 발견하여 처리를 시작합니다.")
+            log_from_thread(log_q, f"총 {len(title_elements)}개 항목을 페이지에서 발견하여 처리를 시작합니다.")
             
             for i in range(len(title_elements)):
                 if len(all_collected_data) >= max_items:
-                    log(f"목표 수집량({max_items}개)에 도달하여 수집을 중단합니다.")
+                    log_from_thread(log_q, f"목표 수집량({max_items}개)에 도달하여 수집을 중단합니다.")
                     break 
+                if stop_event.is_set(): break
+                    
                 try:
                     title = title_elements[i].text.strip()
                     channel = channel_elements[i].text.strip() if i < len(channel_elements) else "N/A"
@@ -507,7 +499,8 @@ def crawl(driver, is_short, dates, country_code, country_name, max_items):
                     subscriber_count_int = convert_subscriber_count_to_int(subscriber_count_text)
                     views_numeric = parse_views_to_int(views)
 
-                    if not should_include_subscriber(subscriber_count_int):
+                    # Pass filter_settings to the check function
+                    if not should_include_subscriber(subscriber_count_int, filter_settings):
                         continue
 
                     thumb_url = ""
@@ -524,34 +517,31 @@ def crawl(driver, is_short, dates, country_code, country_name, max_items):
                         'Thumbnail': thumb_url,
                         'Title': title,
                         'Views': views,
-                        'Views_numeric': views_numeric, # Add numeric views
+                        'Views_numeric': views_numeric,
                         'Channel': channel,
                         'Date': date_obj.strftime('%Y-%m-%d'),
                         'Subscribers': subscriber_count_text,
-                        'Subscribers_numeric': subscriber_count_int, # Add numeric subscribers
+                        'Subscribers_numeric': subscriber_count_int,
                         'Hash': item_hash,
                         'YouTube URL': youtube_url
                     })
                     processed_hashes.add(item_hash)
                     
+                    # 진행률 업데이트
                     current_progress = int((len(all_collected_data) / max_items) * 100)
-                    progress_bar.progress(min(current_progress, 100))
+                    log_q.put(f"PROGRESS:{current_progress}")
 
                 except Exception as e:
-                    log(f"⚠️ 항목 {i+1} 처리 중 오류 발생: {e}")
+                    log_from_thread(log_q, f"⚠️ 항목 {i+1} 처리 중 오류 발생: {e}")
                     continue 
 
-        new_df = pd.DataFrame(all_collected_data)
-        if not new_df.empty:
-            st.session_state.scraped_data = pd.concat([st.session_state.scraped_data, new_df]).drop_duplicates(subset=['Hash']).reset_index(drop=True)
-        
-        log(f"✅ 크롤링 완료! 총 {len(new_df)}개 신규 항목 발견, 현재 총 {len(st.session_state.scraped_data)}개 결과.")
+        result_q.put(pd.DataFrame(all_collected_data))
 
     except Exception as e:
-        log(f"❌ 크롤링 중 심각한 오류 발생: {e}")
+        log_from_thread(log_q, f"❌ 크롤링 중 심각한 오류 발생: {e}")
+        result_q.put(pd.DataFrame())
     finally:
-        st.session_state.is_scraping = False
-        st.session_state.progress = 0
+        log_from_thread(log_q, "CRAWL_COMPLETE")
 
 
 # --- Streamlit UI ---
@@ -565,22 +555,28 @@ with st.sidebar:
         email = st.text_input("Playboard 이메일")
         password = st.text_input("Playboard 비밀번호", type="password")
         
-        st.session_state['2captcha_api_key'] = st.text_input(
-            "2Captcha API 키 (선택 사항)", 
+        api_key_input = st.text_input(
+            "2Captcha API 키", 
             value=st.session_state.get('2captcha_api_key', ''),
             type="password",
-            help="캡챠 자동 해결을 위해 2Captcha API 키를 입력하세요. 브라우저 탭을 닫으면 초기화됩니다."
+            help="캡챠 자동 해결을 위해 2Captcha API 키를 입력하세요. 헤드리스 모드에서 필수적입니다."
         )
+        
+        # if st.button("API 키 저장"): # 버튼 삭제
+        #     st.session_state['2captcha_api_key'] = api_key_input
+        #     save_app_data()
+        #     st.success("API 키가 저장되었습니다.")
 
         st.checkbox("헤드리스 모드로 실행", value=True, key="run_headless", help="체크 해제 시 크롬 창이 나타나며, 캡챠를 직접 해결할 수 있습니다.")
 
         if st.button("로그인", disabled=st.session_state.driver is not None):
-            if email and password:
+            if email and password and api_key_input: # API 키 입력 확인
+                st.session_state['2captcha_api_key'] = api_key_input # 로그인 시 API 키 저장
                 with st.spinner("로그인 중..."):
                     do_login(email, password)
-                    st.rerun()
+                st.rerun()
             else:
-                st.warning("이메일과 비밀번호를 입력해주세요.")
+                st.warning("이메일, 비밀번호, 2Captcha API 키를 모두 입력해주세요.")
         
         st.info(st.session_state.login_status)
         if st.session_state.driver is not None:
@@ -660,9 +656,26 @@ def start_crawl_thread(is_short, settings):
     """Creates and starts the background scraping thread."""
     if st.session_state.driver:
         st.session_state.is_scraping = True
-        st.session_state.log_messages = [] # 로그 초기화
-        st.session_state.scraped_data = pd.DataFrame() # 결과 초기화
+        st.session_state.log_messages = []
+        st.session_state.log_queue = queue.Queue()
+        st.session_state.result_queue = queue.Queue()
+        st.session_state.stop_event = threading.Event()
+
+        # Build a dictionary of all filter settings to pass to the thread
+        selected_filters_dict = {
+            range_name: st.session_state.subscriber_filters[cat][range_name]
+            for cat in st.session_state.subscriber_filters
+            for range_name in st.session_state.subscriber_filters[cat]
+        }
         
+        filter_settings = {
+            'is_filter_applied': st.session_state.is_filter_applied,
+            'selected_filters': selected_filters_dict,
+            'use_custom_filter': st.session_state.use_custom_filter,
+            'custom_min': st.session_state.custom_min,
+            'custom_max': st.session_state.custom_max,
+        }
+
         thread = threading.Thread(
             target=crawl,
             args=(
@@ -671,47 +684,71 @@ def start_crawl_thread(is_short, settings):
                 settings['dates'], 
                 settings['country_code'], 
                 settings['country_name'], 
-                settings['max_items']
+                settings['max_items'],
+                st.session_state.stop_event,
+                st.session_state.log_queue,
+                st.session_state.result_queue,
+                filter_settings  # Pass the settings dictionary
             )
         )
         st.session_state.thread = thread
         thread.start()
-        st.rerun()
 
 col1, col2 = st.columns(2)
 with col1:
     if st.button("🚀 숏폼 크롤링 시작", disabled=(st.session_state.is_scraping or st.session_state.driver is None or not st.session_state.crawl_settings['dates']), use_container_width=True):
+        st.session_state.scraped_data = pd.DataFrame() # 새 크롤링 시 결과 초기화
         settings = st.session_state.crawl_settings
         start_crawl_thread(True, settings)
-        
+        st.rerun()
+
 with col2:
     if st.button("🎬 롱폼 크롤링 시작", disabled=(st.session_state.is_scraping or st.session_state.driver is None or not st.session_state.crawl_settings['dates']), use_container_width=True):
+        st.session_state.scraped_data = pd.DataFrame() # 새 크롤링 시 결과 초기화
         settings = st.session_state.crawl_settings
         start_crawl_thread(False, settings)
+        st.rerun()
 
 # --- Real-time Logging and Progress Display ---
 if st.session_state.get('is_scraping'):
     st.markdown("---")
     st.subheader("🚀 크롤링 진행 상황")
     
-    progress_bar = st.progress(st.session_state.progress)
+    progress_bar = st.progress(st.session_state.get('progress', 0))
     log_placeholder = st.empty()
     
-    while st.session_state.is_scraping:
-        progress_bar.progress(st.session_state.progress)
-        log_placeholder.text_area("실시간 로그", "\n".join(st.session_state.log_messages[-20:]), height=300, key="log_area_scraping")
-        
-        if st.session_state.thread and not st.session_state.thread.is_alive():
-            st.session_state.is_scraping = False
-            st.rerun()
-
-        if st.button("🛑 크롤링 중단", use_container_width=True):
-            st.session_state.is_scraping = False
-            log("🛑 사용자에 의해 크롤링이 중단됩니다...")
-            st.rerun()
-            
-        time.sleep(1)
+    if st.button("🛑 크롤링 중단", use_container_width=True):
+        if st.session_state.stop_event:
+            st.session_state.stop_event.set()
+        st.session_state.is_scraping = False 
         st.rerun()
+
+    while st.session_state.is_scraping:
+        while not st.session_state.log_queue.empty():
+            message = st.session_state.log_queue.get_nowait()
+            if message == "CRAWL_COMPLETE":
+                st.session_state.is_scraping = False
+                break
+            elif isinstance(message, str) and message.startswith("PROGRESS:"):
+                st.session_state.progress = int(message.split(':')[1])
+            else:
+                log(message)
+        
+        if not st.session_state.is_scraping:
+             break
+
+        progress_bar.progress(st.session_state.progress)
+        log_placeholder.text_area("실시간 로그", "\n".join(st.session_state.log_messages), height=300, key="log_area_scraping")
+        time.sleep(0.5) # UI 업데이트 간격 조정
+        st.rerun()
+
+    # Final result processing after the loop
+    while not st.session_state.result_queue.empty():
+        new_df = st.session_state.result_queue.get_nowait()
+        if not new_df.empty:
+            st.session_state.scraped_data = pd.concat([st.session_state.scraped_data, new_df]).drop_duplicates(subset=['Hash']).reset_index(drop=True)
+    log(f"최종 결과 수신 완료. 총 {len(st.session_state.scraped_data)}개 항목.")
+    st.rerun()
 
 # --- Final Log Display after scraping ---
 st.markdown("---")
@@ -719,7 +756,7 @@ st.subheader("📋 전체 로그")
 st.text_area("Logs", "\n".join(st.session_state.log_messages), height=300, key="log_area_final")
 
 # --- Results Display ---
-tab1, tab2 = st.tabs(["📊 크롤링 결과", "�� 유튜브 결과 (현재 세션)"])
+tab1, tab2 = st.tabs(["📊 크롤링 결과", "📺 유튜브 결과 (현재 세션)"])
 
 with tab1:
     st.header("📊 크롤링 결과")
