@@ -611,8 +611,6 @@ with st.sidebar:
 
 
 # --- Main Area ---
-# col1, col2 = st.columns(2) # 열 레이아웃 삭제
-# with col1:
 if st.button("🚀 숏폼 크롤링 시작", disabled=(st.session_state.is_scraping or st.session_state.driver is None or not st.session_state.crawl_settings['dates']), use_container_width=True):
     # st.session_state.scraped_data = pd.DataFrame() # 더 이상 초기화하지 않음
     settings = st.session_state.crawl_settings
@@ -620,7 +618,6 @@ if st.button("🚀 숏폼 크롤링 시작", disabled=(st.session_state.is_scrap
         crawl(True, settings['dates'], settings['country_code'], settings['country_name'], settings['max_items'])
     st.rerun()
 
-# with col2:
 if st.button("🎬 롱폼 크롤링 시작", disabled=(st.session_state.is_scraping or st.session_state.driver is None or not st.session_state.crawl_settings['dates']), use_container_width=True):
     # st.session_state.scraped_data = pd.DataFrame() # 더 이상 초기화하지 않음
     settings = st.session_state.crawl_settings
@@ -638,14 +635,11 @@ with tab1:
     st.header("📊 크롤링 결과")
     if not st.session_state.scraped_data.empty:
         # --- Sorting and Controls ---
-        # sort_col, clear_col = st.columns([3, 1]) # 열 레이아웃 삭제
-        # with sort_col:
         sort_option = st.selectbox(
             "결과 정렬",
-            options=["기본", "조회수 높은 순", "조회수 낮은 순", "구독자 많은 순", "구독자 적은 순"],
+            options=["기본", "채널별 정렬", "조회수 높은 순", "조회수 낮은 순", "구독자 많은 순", "구독자 적은 순"],
             key="sort_scraped"
         )
-        # with clear_col:
         if st.button("크롤링 결과 초기화", use_container_width=True):
             st.session_state.scraped_data = pd.DataFrame()
             st.rerun()
@@ -656,6 +650,7 @@ with tab1:
         elif sort_option == "조회수 낮은 순": display_df = display_df.sort_values(by="Views_numeric", ascending=True)
         elif sort_option == "구독자 많은 순": display_df = display_df.sort_values(by="Subscribers_numeric", ascending=False)
         elif sort_option == "구독자 적은 순": display_df = display_df.sort_values(by="Subscribers_numeric", ascending=True)
+        elif sort_option == "채널별 정렬": display_df = display_df.sort_values(by=['Channel', 'Views_numeric'], ascending=[True, False])
         
         display_df.insert(0, "선택", False)
 
@@ -684,7 +679,18 @@ with tab1:
 with tab2:
     st.header("📺 유튜브 결과 (현재 세션)")
     if not st.session_state.shopping_cart.empty:
+        sort_option_cart = st.selectbox(
+            "유튜브 결과 정렬",
+            options=["기본", "채널별 정렬", "조회수 높은 순", "조회수 낮은 순", "구독자 많은 순", "구독자 적은 순"],
+            key="sort_cart"
+        )
         cart_df_with_selector = st.session_state.shopping_cart.copy()
+        if sort_option_cart == "조회수 높은 순": cart_df_with_selector = cart_df_with_selector.sort_values(by="Views_numeric", ascending=False)
+        elif sort_option_cart == "조회수 낮은 순": cart_df_with_selector = cart_df_with_selector.sort_values(by="Views_numeric", ascending=True)
+        elif sort_option_cart == "구독자 많은 순": cart_df_with_selector = cart_df_with_selector.sort_values(by="Subscribers_numeric", ascending=False)
+        elif sort_option_cart == "구독자 적은 순": cart_df_with_selector = cart_df_with_selector.sort_values(by="Subscribers_numeric", ascending=True)
+        elif sort_option_cart == "채널별 정렬": cart_df_with_selector = cart_df_with_selector.sort_values(by=['Channel', 'Views_numeric'], ascending=[True, False])
+
         cart_df_with_selector.insert(0, "선택", False)
         
         st.info("이곳의 데이터는 앱을 종료해도 유지됩니다. 그룹으로 만들거나 다운로드할 수 있습니다.")
@@ -702,11 +708,7 @@ with tab2:
         st.markdown("---")
         st.subheader("선택한 항목으로 작업하기")
         
-        # --- Grouping ---
-        # group_col1, group_col2 = st.columns([2,1]) # 열 레이아웃 삭제
-        # with group_col1:
         new_group_name = st.text_input("새 그룹 이름", placeholder="예: 7월 1주차 숏폼")
-        # with group_col2:
         if st.button("그룹 만들기", disabled=selected_cart_rows.empty or not new_group_name, use_container_width=True):
             if new_group_name in st.session_state.custom_groups:
                 st.error(f"'{new_group_name}' 그룹이 이미 존재합니다.")
@@ -716,19 +718,18 @@ with tab2:
                 st.success(f"'{new_group_name}' 그룹을 만들었습니다.")
                 time.sleep(1); st.rerun()
 
-        # --- Downloads & Deletion ---
-        dl_col1, dl_col2, clear_col = st.columns(3) # 다운로드 버튼은 가로로 유지
-        with dl_col1:
-            csv_cart = convert_df_to_csv(st.session_state.shopping_cart.drop(columns=['Views_numeric', 'Subscribers_numeric'], errors='ignore'))
-            st.download_button("💾 CSV 다운로드 (전체)", csv_cart, f"youtube_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "text/csv", use_container_width=True)
-        with dl_col2:
-            pdf_cart = convert_df_to_pdf(st.session_state.shopping_cart.drop(columns=['Views_numeric', 'Subscribers_numeric', 'Thumbnail', 'YouTube URL', 'Hash'], errors='ignore'))
-            st.download_button("📄 PDF 다운로드 (전체)", pdf_cart, f"youtube_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf", "application/pdf", use_container_width=True)
-        with clear_col:
-            if st.button("전체 결과 비우기", use_container_width=True):
-                st.session_state.shopping_cart = pd.DataFrame()
-                # save_app_data() # 파일 저장 로직 삭제
-                st.rerun()
+        st.markdown("---") # Visual separator
+
+        csv_cart = convert_df_to_csv(st.session_state.shopping_cart.drop(columns=['Views_numeric', 'Subscribers_numeric'], errors='ignore'))
+        st.download_button("💾 CSV 다운로드 (전체)", csv_cart, f"youtube_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "text/csv", use_container_width=True)
+        
+        pdf_cart = convert_df_to_pdf(st.session_state.shopping_cart.drop(columns=['Views_numeric', 'Subscribers_numeric', 'Thumbnail', 'YouTube URL', 'Hash'], errors='ignore'))
+        st.download_button("📄 PDF 다운로드 (전체)", pdf_cart, f"youtube_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf", "application/pdf", use_container_width=True)
+        
+        if st.button("전체 결과 비우기", use_container_width=True):
+            st.session_state.shopping_cart = pd.DataFrame()
+            # save_app_data() # 파일 저장 로직 삭제
+            st.rerun()
 
     else:
         st.info("결과 테이블에서 항목을 선택하여 '유튜브 결과'에 추가하세요.")
