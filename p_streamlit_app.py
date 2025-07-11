@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import re
 import time
-# import threading # 백그라운드 실행 제거
+import threading
 import queue
 import random
 import hashlib
@@ -97,6 +97,8 @@ def initialize_session_state():
     if '2captcha_api_key' not in st.session_state:
         # st.session_state['2captcha_api_key'] = persistent_data.get('2captcha_api_key', '') # 삭제
         st.session_state['2captcha_api_key'] = ''
+    if 'thread' not in st.session_state:
+        st.session_state.thread = None
 
 initialize_session_state()
 
@@ -384,20 +386,29 @@ def detect_and_handle_captcha(driver):
         except: pass
     return False
 
-def crawl(is_short, dates, country_code, country_name, max_items):
+def crawl(driver, is_short, dates, country_code, country_name, max_items):
+    # This function now accepts 'driver' as an argument
+    # ... (The rest of the crawl function logic is largely the same, 
+    # but it no longer gets the driver from session_state)
+    # It will use the passed 'driver' object.
+    # It will update st.session_state.log_messages and st.session_state.progress
+    # which are safe operations.
     st.session_state.is_scraping = True
     st.session_state.progress = 0
 
     try:
         all_collected_data = []
         processed_hashes = set()
-
-        driver = st.session_state.driver
+        
+        # driver = st.session_state.driver -> This is now passed as an argument
         if not driver:
             log("❌ 드라이버가 없습니다. 먼저 로그인 해주세요.")
             return
 
         for a_date in dates:
+            if not st.session_state.is_scraping:
+                log("🛑 사용자에 의해 크롤링이 중단되었습니다.")
+                break
             try:
                 date_obj = datetime.strptime(a_date, '%Y%m%d')
                 kst = timezone(timedelta(hours=9))
@@ -645,25 +656,70 @@ with st.sidebar:
 
 
 # --- Main Area ---
-if st.button("🚀 숏폼 크롤링 시작", disabled=(st.session_state.is_scraping or st.session_state.driver is None or not st.session_state.crawl_settings['dates']), use_container_width=True):
-    # st.session_state.scraped_data = pd.DataFrame() # 더 이상 초기화하지 않음
-    settings = st.session_state.crawl_settings
-    with st.spinner(f"{settings['max_items']}개 숏폼 크롤링 진행 중..."):
-        crawl(True, settings['dates'], settings['country_code'], settings['country_name'], settings['max_items'])
-    st.rerun()
+def start_crawl_thread(is_short, settings):
+    """Creates and starts the background scraping thread."""
+    if st.session_state.driver:
+        st.session_state.is_scraping = True
+        st.session_state.log_messages = [] # 로그 초기화
+        st.session_state.scraped_data = pd.DataFrame() # 결과 초기화
+        
+        thread = threading.Thread(
+            target=crawl,
+            args=(
+                st.session_state.driver, 
+                is_short, 
+                settings['dates'], 
+                settings['country_code'], 
+                settings['country_name'], 
+                settings['max_items']
+            )
+        )
+        st.session_state.thread = thread
+        thread.start()
+        st.rerun()
 
-if st.button("🎬 롱폼 크롤링 시작", disabled=(st.session_state.is_scraping or st.session_state.driver is None or not st.session_state.crawl_settings['dates']), use_container_width=True):
-    # st.session_state.scraped_data = pd.DataFrame() # 더 이상 초기화하지 않음
-    settings = st.session_state.crawl_settings
-    with st.spinner(f"{settings['max_items']}개 롱폼 크롤링 진행 중..."):
-        crawl(False, settings['dates'], 'south-korea', '한국', settings['max_items'])
-    st.rerun()
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("🚀 숏폼 크롤링 시작", disabled=(st.session_state.is_scraping or st.session_state.driver is None or not st.session_state.crawl_settings['dates']), use_container_width=True):
+        settings = st.session_state.crawl_settings
+        start_crawl_thread(True, settings)
+        
+with col2:
+    if st.button("🎬 롱폼 크롤링 시작", disabled=(st.session_state.is_scraping or st.session_state.driver is None or not st.session_state.crawl_settings['dates']), use_container_width=True):
+        settings = st.session_state.crawl_settings
+        start_crawl_thread(False, settings)
 
-# --- Logging and Progress Display ---
+# --- Real-time Logging and Progress Display ---
+if st.session_state.get('is_scraping'):
+    st.markdown("---")
+    st.subheader("🚀 크롤링 진행 상황")
+    
+    progress_bar = st.progress(st.session_state.progress)
+    log_placeholder = st.empty()
+    
+    while st.session_state.is_scraping:
+        progress_bar.progress(st.session_state.progress)
+        log_placeholder.text_area("실시간 로그", "\n".join(st.session_state.log_messages[-20:]), height=300, key="log_area_scraping")
+        
+        if st.session_state.thread and not st.session_state.thread.is_alive():
+            st.session_state.is_scraping = False
+            st.rerun()
+
+        if st.button("🛑 크롤링 중단", use_container_width=True):
+            st.session_state.is_scraping = False
+            log("🛑 사용자에 의해 크롤링이 중단됩니다...")
+            st.rerun()
+            
+        time.sleep(1)
+        st.rerun()
+
+# --- Final Log Display after scraping ---
+st.markdown("---")
+st.subheader("📋 전체 로그")
 st.text_area("Logs", "\n".join(st.session_state.log_messages), height=300, key="log_area_final")
 
 # --- Results Display ---
-tab1, tab2 = st.tabs(["📊 크롤링 결과", "📺 유튜브 결과 (현재 세션)"])
+tab1, tab2 = st.tabs(["📊 크롤링 결과", "�� 유튜브 결과 (현재 세션)"])
 
 with tab1:
     st.header("📊 크롤링 결과")
