@@ -317,83 +317,52 @@ def detect_and_handle_captcha(driver):
         # 1. 메인 프레임에서 'reCAPTCHA' iframe 찾기
         recaptcha_iframe = driver.find_elements(By.CSS_SELECTOR, "iframe[title='reCAPTCHA']")
         if not recaptcha_iframe:
-            return None # 캡챠 없음
+            return True # 캡챠가 더 이상 보이지 않으면 성공으로 간주
 
         log("INFO: '로봇이 아닙니다' 캡챠 iframe 발견.")
-        driver.switch_to.frame(recaptcha_iframe[0])
         
-        # 2. '로봇이 아닙니다' 체크박스 클릭
-        checkbox = driver.find_elements(By.ID, "recaptcha-anchor")
-        if checkbox:
-            checkbox[0].click()
-            log("INFO: '로봇이 아닙니다' 체크박스를 클릭했습니다.")
-            time.sleep(3) # 이미지 챌린지가 로드될 시간을 줍니다.
+        # 캡챠를 풀기 위해 필요한 정보 추출
+        site_key_element = driver.find_element(By.CSS_SELECTOR, ".g-recaptcha")
+        site_key = site_key_element.get_attribute("data-sitekey")
+        page_url = driver.current_url
         
-        # 3. 기본 컨텐츠로 돌아와서, 이미지 챌린지 iframe 찾기
-        driver.switch_to.default_content()
-        challenge_iframe = driver.find_elements(By.CSS_SELECTOR, "iframe[title*='보안문자']")
-        
-        if not challenge_iframe:
-            log("INFO: 이미지 챌린지가 나타나지 않았습니다. 캡챠가 해결된 것 같습니다.")
+        if not st.session_state.get('2captcha_api_key'):
+            log("🚨 캡챠가 감지되었으나, 2Captcha API 키가 없습니다. 자동 해결을 건너뜁니다.")
+            return False
+
+        log("🚨 캡챠 감지됨! 2Captcha로 자동 해결을 시도합니다.")
+        config = {'apiKey': st.session_state['2captcha_api_key']}
+        solver = TwoCaptcha(**config)
+
+        try:
+            result = solver.recaptcha(sitekey=site_key, url=page_url)
+            log("✅ 2Captcha 해결 완료. 토큰을 주입합니다.")
+            
+            recaptcha_response = result['code']
+            
+            # JavaScript를 사용하여 숨겨진 textarea에 값 설정 및 콜백 실행
+            driver.execute_script(f"""
+                document.getElementById('g-recaptcha-response').innerHTML = '{recaptcha_response}';
+            """)
+            
+            # 콜백 함수가 있는지 확인하고 실행
+            callback_func = site_key_element.get_attribute("data-callback")
+            if callback_func:
+                driver.execute_script(f"{callback_func}('{recaptcha_response}');")
+                log("INFO: 캡챠 콜백 함수를 실행했습니다.")
+            else:
+                log("WARN: 콜백 함수를 찾을 수 없습니다. 직접 제출을 시도해야 할 수 있습니다.")
+
+            time.sleep(5) # 캡챠 해결 후 페이지가 변경될 시간을 줍니다.
             return True
 
-        if st.session_state.get('2captcha_api_key'):
-            log("🚨 이미지 선택형 캡챠 발견! 2Captcha로 자동 해결을 시도합니다.")
-            driver.switch_to.frame(challenge_iframe[0])
-
-            # 4. 이미지 캡처 및 질문 추출
-            img_element = driver.find_element(By.CSS_SELECTOR, "img.rc-image-tile-44")
-            img_base64 = img_element.screenshot_as_base64
-            
-            instruction_element = driver.find_element(By.CSS_SELECTOR, ".rc-imageselect-instructions strong")
-            instruction_text = instruction_element.text
-            log(f"캡챠 질문: '{instruction_text}'에 해당하는 이미지를 선택합니다.")
-
-            # 5. 2Captcha로 해결 요청
-            config = {'apiKey': st.session_state['2captcha_api_key']}
-            solver = TwoCaptcha(**config)
-            try:
-                result = solver.recaptcha(
-                    sitekey=driver.find_element(By.CSS_SELECTOR, ".g-recaptcha").get_attribute('data-sitekey'), # 사이트 키를 다시 가져옴
-                    url=driver.current_url,
-                    method='image',
-                    textinstructions=instruction_text,
-                    body=f'base64:{img_base64}'
-                )
-                
-                log("✅ 2Captcha 이미지 분석 완료. 토큰을 주입합니다.")
-                recaptcha_response = result['code']
-                
-                driver.switch_to.default_content() # 토큰 주입을 위해 기본 프레임으로 돌아감
-                driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML = '{recaptcha_response}';")
-                log("INFO: 캡챠 해결 토큰 주입 완료.")
-                
-                # 콜백 함수 실행 또는 제출 시도
-                driver.switch_to.frame(challenge_iframe[0]) # 다시 챌린지 프레임으로
-                verify_button = driver.find_element(By.ID, "recaptcha-verify-button")
-                verify_button.click()
-                log("INFO: 확인 버튼 클릭.")
-                
-                driver.switch_to.default_content()
-                time.sleep(5)
-                return True
-
-            except Exception as e:
-                log(f"❌ 2Captcha 이미지 해결 실패: {e}")
-                driver.switch_to.default_content()
-                return False
-        
-        elif challenge_iframe:
-             log("이미지 캡챠가 감지되었으나, 2Captcha API 키가 없습니다. 헤드리스 모드를 끄고 직접 해결해주세요.")
-             driver.switch_to.default_content()
-             return False
+        except Exception as e:
+            log(f"❌ 2Captcha 해결 실패: {e}")
+            return False
 
     except Exception as e:
         log(f"⚠️ 캡챠 감지/처리 중 예상치 못한 오류: {e}")
-        try:
-            driver.switch_to.default_content()
-        except: pass
-    return False
+        return False
 
 def crawl(driver, is_short, dates, country_code, country_name, max_items, stop_event, log_q, result_q, filter_settings):
     try:
@@ -456,15 +425,20 @@ def crawl(driver, is_short, dates, country_code, country_name, max_items, stop_e
                 time.sleep(2.5) 
                 
                 new_items_on_page = len(driver.find_elements(By.CSS_SELECTOR, "a.title__label"))
+
                 if new_items_on_page == prev_items_count:
                     no_change_count += 1
                     log_from_thread(log_q, f"⚠️ 스크롤 후 새 항목이 로드되지 않았습니다. ({no_change_count}/3)")
                     if no_change_count >= 3:
-                        log_from_thread(log_q, "더 이상 새 항목이 로드되지 않아 스크롤을 중단합니다.")
-                        if not detect_and_handle_captcha(driver):
-                            break
-                        else: 
-                            no_change_count = 0
+                        log_from_thread(log_q, "더 이상 새 항목이 로드되지 않아 캡챠 해결을 시도합니다.")
+                        # Call captcha handler
+                        captcha_solved = detect_and_handle_captcha(driver)
+                        if captcha_solved:
+                            log_from_thread(log_q, "캡챠 해결 후 스크롤을 계속합니다.")
+                            no_change_count = 0 # Reset counter after handling
+                        else:
+                            log_from_thread(log_q, "캡챠 해결에 실패하여 스크롤을 중단합니다.")
+                            break # Stop scrolling for this date
                 else:
                     no_change_count = 0
                 prev_items_count = new_items_on_page
